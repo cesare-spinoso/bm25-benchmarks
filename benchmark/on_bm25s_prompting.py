@@ -18,16 +18,67 @@ from bm25s.utils.beir import (
     merge_cqa_dupstack,
     postprocess_results_for_eval,
 )
+import google.generativeai as genai
+from hidden import GOOGLE_API_KEY
 
 PROMPT = """
 I am using BM25 to search a corpus. Please rewrite my search query below into {n} most relevant alternative search queries. Separate each query with a comma and do not write anything else including numbering. Initial query: \"{query}\" Query alternatives (comma separated):
 """
 
-GEMMA_API_KEY = "AIzaSyAgf3b4s08oDcBoWKerszO75lO3y3fknNs"
 
+def get_alternative_queries(
+    query: str, prompt: str, n: int, llm: str, model: genai.GenerativeModel
+) -> list[str]:
+    # Read cache, create {} if DNE
+    cache_name = f"{llm}_cache.json"
+    if not os.path.exists(cache_name):
+        cache = {}
+    else:
+        with open(cache_name, "r") as f:
+            cache = json.load(f)
+    if not query in cache:
+        response = model.generate_content(prompt.format(n=n, query=query))
+        response = response.text.split(",")
+        cache[query] = response
+        with open(cache_name, "w") as f:
+            json.dump(cache, f, indent=4)
+        # print("Waiting 1 minute to make more requests")
+        # time.sleep(60)
+    return cache[query]
+
+def average_scores(k_values, scores):
+        ndcg = {}
+        _map = {}
+        recall = {}
+        precision = {}
+        
+        for k in k_values:
+            ndcg[f"NDCG@{k}"] = 0.0
+            _map[f"MAP@{k}"] = 0.0
+            recall[f"Recall@{k}"] = 0.0
+            precision[f"P@{k}"] = 0.0
+        
+        for query_id in scores.keys():
+            for k in k_values:
+                ndcg[f"NDCG@{k}"] += scores[query_id]["ndcg_cut_" + str(k)]
+                _map[f"MAP@{k}"] += scores[query_id]["map_cut_" + str(k)]
+                recall[f"Recall@{k}"] += scores[query_id]["recall_" + str(k)]
+                precision[f"P@{k}"] += scores[query_id]["P_"+ str(k)]
+        
+        for k in k_values:
+            ndcg[f"NDCG@{k}"] = round(ndcg[f"NDCG@{k}"]/len(scores), 5)
+            _map[f"MAP@{k}"] = round(_map[f"MAP@{k}"]/len(scores), 5)
+            recall[f"Recall@{k}"] = round(recall[f"Recall@{k}"]/len(scores), 5)
+            precision[f"P@{k}"] = round(precision[f"P@{k}"]/len(scores), 5)
+        
+
+        return ndcg, _map, recall, precision
 
 def main(
     dataset,
+    n=10,
+    prompt=PROMPT,
+    llm="gemini-1.5-flash",
     n_threads=1,
     top_k=1000,
     method="lucene",
@@ -62,10 +113,28 @@ def main(
 
     del corpus
 
-    qids, queries_lst = [], []
-    for key, val in queries.items():
-        qids.append(key)
+    grouped_qids, qids, queries_lst = [], [], []
+    new_qrels = {}
+    genai.configure(api_key=GOOGLE_API_KEY)
+    model = genai.GenerativeModel(llm)
+    cntr = 1
+    for key, val in tqdm(queries.items()):
+        group_qids = []
+        qids.append(str(cntr))
         queries_lst.append(val)
+        group_qids.append(str(cntr))
+        new_qrels[str(cntr)] = qrels[key]
+        cntr += 1 
+        alternative_queries = get_alternative_queries(
+            query=val, prompt=prompt, n=n, llm=llm, model=model
+        )
+        for altq in alternative_queries:
+            qids.append(str(cntr))
+            queries_lst.append(altq)
+            group_qids.append(str(cntr))
+            new_qrels[str(cntr)] = qrels[key]
+            cntr += 1
+        grouped_qids.append(group_qids)
 
     print("=" * 50)
     print("Dataset: ", dataset)
@@ -76,7 +145,7 @@ def main(
     stemmer_name = None if stemmer_name == "none" else stemmer_name
     stopwords = None if stopwords == "none" else stopwords
     stemmer = Stemmer.Stemmer("english") if stemmer_name == "snowball" else None
-    
+
     timer = Timer("[BM25S]")
     t = timer.start("Tokenize Corpus")
     corpus_tokenized = bm25s.tokenize(
@@ -109,7 +178,7 @@ def main(
     model = bm25s.BM25(method=method, k1=k1, b=b, delta=delta)
     model.index((corpus_tokenized.ids, corpus_tokenized.vocab), leave_progress=False)
     timer.stop(t, show=True, n_total=num_docs)
-    
+
     if not skip_scoring:
         t = timer.start("Score")
         for q in tqdm(queries_tokenized, desc="BM25S Scoring", leave=False):
@@ -146,8 +215,27 @@ def main(
         assert np.allclose(queried_scores, queried_scores_np, atol=1e-6)
 
     results_dict = postprocess_results_for_eval(queried_results, queried_scores, qids)
-    ndcg, _map, recall, precision = EvaluateRetrieval.evaluate(
-        qrels, results_dict, [1, 10, 100, 1000]
+    scores = EvaluateRetrieval.evaluate(
+        new_qrels, results_dict, [1, 10, 100, 1000], return_raw_scores=True
+    )
+
+    # NOTE: This is an unfair comparison,
+    # at test can't just take the max
+    # Only to test the idea in principle
+    maxed_scores = {}
+    for i, group_qids in enumerate(grouped_qids):
+        group_scores = []
+        for qid in group_qids:
+            group_scores.append(scores[qid])
+        metric_names = list(group_scores[0].keys())
+        maxed_scores[i] = {
+            metric_name: max([dict_[metric_name] for dict_ in group_scores]) for metric_name in metric_names
+        }
+    
+
+    ndcg, _map, recall, precision = average_scores(
+        k_values=[1, 10, 100, 1000],
+        scores=maxed_scores,
     )
 
     max_mem_gb = get_max_memory_usage("GB")
@@ -294,7 +382,6 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip numpy retrieval step.",
     )
-
 
     kwargs = vars(parser.parse_args())
     profile = kwargs.pop("profile")

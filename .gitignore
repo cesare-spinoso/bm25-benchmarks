@@ -171,3 +171,6 @@ venv-*
 comparison_results
 analysis/out
 analysis/comparison_results
+
+# Ignore hidden.py containing API KEYS
+hidden.py
